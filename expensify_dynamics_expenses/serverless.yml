@@ -1,0 +1,105 @@
+service: expensify-dynamics
+provider:
+  timeout: 300
+  name: aws
+  runtime: python3.6
+  stage: dev
+  environment:
+    SERVERLESS_SERVICE: ${self:service}
+  iamRoleStatements:
+    - Effect: Allow
+      Action:
+        - lambda:*
+        - s3:GetObject
+        - sqs:DeleteMessage
+        - sqs:GetQueueUrl
+        - sqs:ReceiveMessage
+        - sqs:SendMessage
+        - sqs:SendMessageBatch
+      Resource: "*"
+
+functions:
+  controller:
+    handler: src/dynamics_controller.start
+    environment:
+      DYNAMICS_EXPENSES_ENDPOINT: '/data/IDEO_Expenses'
+      DYNAMICS_CLIENT_ID: ${self:custom.api_keys.DYNAMICS.CLIENT_ID}
+      DYNAMICS_USER_NAME: ${self:custom.api_keys.DYNAMICS.USER_NAME}
+      DYNAMICS_USER_PASSWORD: ${self:custom.api_keys.DYNAMICS.PASSWORD}
+      DYNAMICS_BASE_URL: ${self:custom.env_variables.DYNAMICS.BASE_URL}
+      QUEUE_NAME: ${self:custom.expenses_queue_name}
+    events:
+      - s3:
+          bucket: erp-csv-repository-expensify-dynamics-${opt:stage, self:provider.stage}
+          event: s3:ObjectCreated:*
+
+  trigger-report:
+    handler: src/trigger_report.execute
+    environment:
+      EXPENSIFY_API_URL: ${self:custom.env_variables.EXPENSIFY.API_URL}
+      EXPENSIFY_USER_ID: ${self:custom.api_keys.EXPENSIFY.USER_ID}
+      EXPENSIFY_USER_SECRET: ${self:custom.api_keys.EXPENSIFY.USER_SECRET}
+      HOST: ${self:custom.api_keys.EXPENSIFY.HOST}
+      LOGIN: ${self:custom.api_keys.EXPENSIFY.LOGIN}
+      PASSWORD: ${self:custom.api_keys.EXPENSIFY.PASSWORD}
+      TEMPLATE_BUCKET_NAME: expensify-dynamics-template-${opt:stage, self:provider.stage}
+      TEMPLATE_BUCKET_KEY: Dynamics365 Export.rtf
+      REQUIREMENTS_BUCKET_KEY: Expensify Requirements.json
+    events:
+      - schedule:
+          rate: cron(0 0/4 * * ? *)
+          enabled: ${self:custom.env_variables.SCHEDULED}
+
+  sqs-next-lambda-starter:
+    handler: lib/sqs_next_lambda_starter.execute
+    environment:
+      SOURCE_QUEUE_NAME: ${self:custom.expenses_queue_name}
+      MESSAGE_LIMIT: 200
+      NEXT_LAMBDA: ${self:custom.lambda_base_name}-dynamics-client
+      DESTINATION: dynamics
+      SOURCE: mavenlink
+    events:
+      - schedule:
+          rate: cron(* * * * ? *)  # every minute
+          enabled: true
+
+  dynamics-client:
+    handler: src/filtering_dynamics_client.api_post
+    environment:
+      DYNAMICS_CLIENT_ID: ${self:custom.api_keys.DYNAMICS.CLIENT_ID}
+      DYNAMICS_USER_NAME: ${self:custom.api_keys.DYNAMICS.USER_NAME}
+      DYNAMICS_USER_PASSWORD: ${self:custom.api_keys.DYNAMICS.PASSWORD}
+      DYNAMICS_BASE_URL: ${self:custom.env_variables.DYNAMICS.BASE_URL}
+
+custom:
+  api_keys: ${file(../api_keys/${opt:stage, self:provider.stage}.yml)}
+  env_variables: ${file(../env_variables/${opt:stage, self:provider.stage}.yml)}
+  accountId: ${self:custom.env_variables.ACCOUNT_ID}
+  lambda_base_name: expensify-dynamics-${opt:stage, self:provider.stage}
+  expenses_queue_name: Expenses${opt:stage, self:provider.stage}.fifo
+  sentry:
+    dsn: ${self:custom.api_keys.SENTRY.DSN}
+    release:
+      version: git
+  pythonRequirements:
+    dockerizePip: non-linux
+    dockerFile: ./Dockerfile.packaging
+
+resources:
+  Resources:
+    MigrateQueue:
+      Type: "AWS::SQS::Queue"
+      Properties:
+        QueueName: ${self:custom.expenses_queue_name}
+        ContentBasedDeduplication: true
+        FifoQueue: true
+        VisibilityTimeout: 600
+
+plugins:
+  - serverless-python-requirements
+  - serverless-sentry
+
+package:
+  exclude:
+    - node_modules/**
+    - tests/**
